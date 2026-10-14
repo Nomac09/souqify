@@ -1,0 +1,487 @@
+'use client'
+
+import { useEffect, useMemo, useState } from 'react'
+import Link from 'next/link'
+import { useRouter } from 'next/navigation'
+import { useSession } from 'next-auth/react'
+import { AlertCircle, ArrowRight, ShoppingBag, Trash2 } from 'lucide-react'
+import { useCart } from '@/lib/cart'
+import { formatPrice } from '@/components/Sticker'
+import { SHIPPING_METHODS, SHIPPING_LABELS, RELAY_MAX_KG, getShippingQuotes, type ShippingMethod } from '@/lib/shipping'
+import { COMPANY, PRICE_NOTICE } from '@/lib/company'
+import { getCartDeliveryPromise, formatDeliveryDate } from '@/lib/delivery'
+import { trackEvent } from '@/lib/analytics'
+
+// What the mode is, in one line. The *delay* is not written here: it
+// comes from lib/delivery.ts, so the sentence under each option is the
+// same sentence the product page showed and the confirmation email will
+// repeat. The previous hardcoded "Cocolis · 3 à 5 jours" is exactly the
+// drift that cost this file its delay strings.
+const SHIPPING_DETAIL: Record<ShippingMethod, string> = {
+  pickup: 'Gratuit, à Bondues (59)',
+  relay: `Mondial Relay · max ${RELAY_MAX_KG} kg`,
+  home: 'Cocolis',
+}
+
+const UNAVAILABLE_REASON: Record<string, string> = {
+  'item-too-heavy': 'Indisponible — une pièce dépasse la limite de poids pour ce mode.',
+  'cart-too-heavy': `Indisponible — le panier dépasse ${RELAY_MAX_KG} kg au total.`,
+}
+
+interface CustomerForm {
+  name: string
+  phone: string
+  line1: string
+  line2: string
+  postalCode: string
+  city: string
+}
+
+const EMPTY_CUSTOMER: CustomerForm = { name: '', phone: '', line1: '', line2: '', postalCode: '', city: '' }
+
+export default function CartPage() {
+  const { items, removeItem, total } = useCart()
+  const { status } = useSession()
+  const [shippingMethod, setShippingMethod] = useState<ShippingMethod>('pickup')
+  const [customer, setCustomer] = useState<CustomerForm>(EMPTY_CUSTOMER)
+  const [isLoading, setIsLoading] = useState(false)
+  const [error, setError] = useState('')
+  const [unavailable, setUnavailable] = useState<string[]>([])
+  const [cgvAccepted, setCgvAccepted] = useState(false)
+  const router = useRouter()
+
+  const quotes = useMemo(
+    () => getShippingQuotes(items.map((i) => i.weight || 0)),
+    [items]
+  )
+
+  // The delay the buyer is shown before paying, for the mode they picked.
+  // Same function as the product page and the confirmation email, so the
+  // three cannot disagree about what was promised.
+  const promises = useMemo(() => {
+    const weights = items.map((i) => i.weight || 0)
+    return {
+      pickup: getCartDeliveryPromise(weights, 'pickup'),
+      relay: getCartDeliveryPromise(weights, 'relay'),
+      home: getCartDeliveryPromise(weights, 'home'),
+    } as Record<ShippingMethod, ReturnType<typeof getCartDeliveryPromise>>
+  }, [items])
+
+  // If the cart changes (an item added/removed) and that makes the
+  // currently-selected method no longer available, fall back to pickup —
+  // always valid — rather than silently checking out with a stale choice.
+  useEffect(() => {
+    if (!quotes[shippingMethod].available) setShippingMethod('pickup')
+  }, [quotes, shippingMethod])
+
+  useEffect(() => {
+    if (status !== 'authenticated') return
+    fetch('/api/account')
+      .then((res) => (res.ok ? res.json() : null))
+      .then((data) => {
+        if (!data) return
+        setCustomer({
+          name: data.name || '',
+          phone: data.phone || '',
+          line1: data.address?.line1 || '',
+          line2: data.address?.line2 || '',
+          postalCode: data.address?.postalCode || '',
+          city: data.address?.city || '',
+        })
+      })
+      .catch(() => {})
+  }, [status])
+
+  const setField = (key: keyof CustomerForm, value: string) =>
+    setCustomer((c) => ({ ...c, [key]: value }))
+
+  const customerComplete =
+    customer.name.trim() && customer.phone.trim() && customer.line1.trim() && customer.postalCode.trim() && customer.city.trim()
+
+  const handleCheckout = async () => {
+    setIsLoading(true)
+    setError('')
+    setUnavailable([])
+    trackEvent('begin_checkout', {
+      currency: 'EUR',
+      value: total() + quotes[shippingMethod].cost,
+      shipping_tier: shippingMethod,
+      items_count: items.length,
+    })
+    try {
+      const response = await fetch('/api/checkout/create-session', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          items: items.map((item) => ({ productId: item.productId })),
+          shippingMethod,
+          cgvAccepted,
+          customer: {
+            name: customer.name,
+            phone: customer.phone,
+            address: {
+              line1: customer.line1,
+              line2: customer.line2,
+              postalCode: customer.postalCode,
+              city: customer.city,
+            },
+          },
+        }),
+      })
+
+      if (response.status === 409) {
+        const data = await response.json()
+
+        if (data.error === 'shipping-unavailable') {
+          // The server re-checks weight independently of the cart page's
+          // own preview — if they disagree, something changed between
+          // page load and checkout (e.g. cart edited in another tab).
+          setShippingMethod('pickup')
+          setError('Ce mode de livraison n’est plus disponible pour ce panier — sélection remise sur le retrait à l’entrepôt.')
+          setIsLoading(false)
+          return
+        }
+
+        const unavailableIds: string[] = data.items?.map((i: { productId: string }) => i.productId) || []
+        const names: string[] = data.items?.map((i: { name: string }) => i.name) || []
+        unavailableIds.forEach((id) => removeItem(id))
+        setUnavailable(names)
+        setIsLoading(false)
+        return
+      }
+
+      if (response.status === 400) {
+        const data = await response.json().catch(() => null)
+        setError(
+          data?.error === 'cgv-not-accepted'
+            ? 'Merci d’accepter les conditions générales de vente avant de payer.'
+            : 'Merci de renseigner vos coordonnées complètes avant de payer.'
+        )
+        setIsLoading(false)
+        return
+      }
+
+      if (response.status === 403) {
+        const data = await response.json().catch(() => null)
+        if (data?.error === 'email-not-verified') {
+          setError('Confirmez votre email avant de payer — un lien de vérification vous a été envoyé à l’inscription. Vous pouvez le renvoyer depuis votre compte.')
+          setIsLoading(false)
+          return
+        }
+      }
+
+      const { clientSecret } = await response.json()
+      if (!clientSecret) throw new Error('no-client-secret')
+      sessionStorage.setItem('souqify-checkout-secret', clientSecret)
+      router.push('/checkout')
+    } catch {
+      setError(`Le paiement n’a pas pu démarrer. Réessayez, ou écrivez-nous à ${COMPANY.email}.`)
+      setIsLoading(false)
+    }
+  }
+
+  if (items.length === 0) {
+    return (
+      <div className="container mx-auto px-4 py-24 text-center">
+        <ShoppingBag aria-hidden className="mx-auto h-10 w-10 text-dust" />
+        <h1 className="mt-4 font-display text-3xl text-ink">
+          Votre panier est vide
+        </h1>
+        <p className="mx-auto mt-2 max-w-md text-dust">
+          Chaque pièce est en un seul exemplaire.
+        </p>
+        <Link
+          href="/"
+          className="mt-6 inline-flex items-center gap-2 rounded-full bg-verdigris px-8 py-3 text-sm font-semibold text-stone transition-colors hover:bg-verdigris-deep"
+        >
+          Voir la collection
+          <ArrowRight aria-hidden className="h-4 w-4" />
+        </Link>
+      </div>
+    )
+  }
+
+  return (
+    <div className="container mx-auto px-4 py-10">
+      <h1 className="font-display text-3xl tracking-tight text-ink">
+        Votre panier
+      </h1>
+      <p className="mt-1 font-mono text-[11px] uppercase tracking-widest text-dust">
+        {items.length} article{items.length > 1 ? 's' : ''}
+      </p>
+
+      {status !== 'authenticated' && (
+        <p className="mt-3 text-sm text-dust">
+          <Link href={`/login?callbackUrl=${encodeURIComponent('/cart')}`} className="font-semibold text-verdigris-deep hover:underline">
+            Connectez-vous
+          </Link>{' '}
+          pour préremplir vos coordonnées la prochaine fois.
+        </p>
+      )}
+
+      {unavailable.length > 0 && (
+        <div role="alert" className="mt-6 flex items-start gap-2 rounded-lg bg-alert-pale px-4 py-3 text-sm text-alert">
+          <AlertCircle aria-hidden className="mt-0.5 h-4 w-4 shrink-0" />
+          <span>
+            {unavailable.length === 1
+              ? `« ${unavailable[0]} » vient d’être vendue — elle a été retirée de votre panier.`
+              : `Ces pièces viennent d’être vendues et ont été retirées de votre panier : ${unavailable.join(', ')}.`}
+          </span>
+        </div>
+      )}
+
+      <div className="mt-8 grid grid-cols-1 gap-8 lg:grid-cols-3">
+        <div className="space-y-6 lg:col-span-2">
+          <ul className="space-y-3">
+            {items.map((item) => (
+              <li
+                key={item.productId}
+                className="flex gap-4 rounded-xl border border-hairline bg-surface p-4 shadow-carte"
+              >
+                <img
+                  src={item.photo || '/placeholder.png'}
+                  alt=""
+                  className="h-24 w-24 shrink-0 rounded-lg border border-hairline bg-paper object-contain p-1.5"
+                />
+                <div className="min-w-0 flex-1">
+                  <h2 className="line-clamp-2 font-medium leading-snug text-ink">
+                    {item.name}
+                  </h2>
+                  <p className="mt-1 font-mono font-semibold text-ink">
+                    {formatPrice(item.price)} €
+                  </p>
+                </div>
+                <button
+                  onClick={() => removeItem(item.productId)}
+                  aria-label={`Retirer ${item.name}`}
+                  className="self-start p-1.5 text-dust transition-colors hover:text-alert"
+                >
+                  <Trash2 aria-hidden className="h-4 w-4" />
+                </button>
+              </li>
+            ))}
+          </ul>
+
+          <div className="rounded-xl border border-hairline bg-surface p-6 shadow-carte">
+            <h2 className="tag-label">Vos coordonnées</h2>
+            <div className="mt-4 space-y-4">
+              <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+                <div>
+                  <label htmlFor="cust-name" className="tag-label">Nom complet</label>
+                  <input
+                    id="cust-name"
+                    type="text"
+                    required
+                    value={customer.name}
+                    onChange={(e) => setField('name', e.target.value)}
+                    className="mt-1.5 w-full rounded-lg border border-hairline px-3.5 py-2.5 text-sm text-ink focus:border-verdigris"
+                  />
+                </div>
+                <div>
+                  <label htmlFor="cust-phone" className="tag-label">Téléphone</label>
+                  <input
+                    id="cust-phone"
+                    type="tel"
+                    required
+                    placeholder="06 12 34 56 78"
+                    value={customer.phone}
+                    onChange={(e) => setField('phone', e.target.value)}
+                    className="mt-1.5 w-full rounded-lg border border-hairline px-3.5 py-2.5 text-sm text-ink focus:border-verdigris"
+                  />
+                </div>
+              </div>
+              <div>
+                <label htmlFor="cust-line1" className="tag-label">Adresse</label>
+                <input
+                  id="cust-line1"
+                  type="text"
+                  required
+                  value={customer.line1}
+                  onChange={(e) => setField('line1', e.target.value)}
+                  className="mt-1.5 w-full rounded-lg border border-hairline px-3.5 py-2.5 text-sm text-ink focus:border-verdigris"
+                />
+              </div>
+              <div>
+                <label htmlFor="cust-line2" className="tag-label">Complément (optionnel)</label>
+                <input
+                  id="cust-line2"
+                  type="text"
+                  value={customer.line2}
+                  onChange={(e) => setField('line2', e.target.value)}
+                  className="mt-1.5 w-full rounded-lg border border-hairline px-3.5 py-2.5 text-sm text-ink focus:border-verdigris"
+                />
+              </div>
+              <div className="grid grid-cols-2 gap-4">
+                <div>
+                  <label htmlFor="cust-postal" className="tag-label">Code postal</label>
+                  <input
+                    id="cust-postal"
+                    type="text"
+                    required
+                    value={customer.postalCode}
+                    onChange={(e) => setField('postalCode', e.target.value)}
+                    className="mt-1.5 w-full rounded-lg border border-hairline px-3.5 py-2.5 text-sm text-ink focus:border-verdigris"
+                  />
+                </div>
+                <div>
+                  <label htmlFor="cust-city" className="tag-label">Ville</label>
+                  <input
+                    id="cust-city"
+                    type="text"
+                    required
+                    value={customer.city}
+                    onChange={(e) => setField('city', e.target.value)}
+                    className="mt-1.5 w-full rounded-lg border border-hairline px-3.5 py-2.5 text-sm text-ink focus:border-verdigris"
+                  />
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div className="space-y-4">
+          <div className="rounded-xl border border-hairline bg-surface p-6 shadow-carte">
+            <h2 className="font-display text-lg text-ink">Récapitulatif</h2>
+
+            <fieldset className="mt-4">
+              <legend className="tag-label">Comment récupérer vos pièces ?</legend>
+              <div className="mt-3 space-y-2">
+                {SHIPPING_METHODS.map((key) => {
+                  const quote = quotes[key]
+                  const active = shippingMethod === key
+                  return (
+                    <label
+                      key={key}
+                      className={`flex items-center justify-between gap-3 rounded-lg border p-3 transition-colors ${
+                        !quote.available
+                          ? 'cursor-not-allowed border-hairline opacity-50'
+                          : active
+                            ? 'cursor-pointer border-verdigris bg-verdigris/10'
+                            : 'cursor-pointer border-hairline hover:border-hairline-strong'
+                      }`}
+                    >
+                      <input
+                        type="radio"
+                        name="shipping"
+                        value={key}
+                        checked={active}
+                        disabled={!quote.available}
+                        onChange={() => setShippingMethod(key)}
+                        className="sr-only"
+                      />
+                      <span className="min-w-0">
+                        <span className="block text-sm font-semibold text-ink">{SHIPPING_LABELS[key]}</span>
+                        <span className="block text-xs text-dust">
+                          {quote.available ? SHIPPING_DETAIL[key] : UNAVAILABLE_REASON[quote.reason!]}
+                        </span>
+                        {quote.available && (
+                          <span className="mt-0.5 block text-xs leading-relaxed text-ink/70">
+                            {promises[key].text}
+                          </span>
+                        )}
+                      </span>
+                      {quote.available && (
+                        <span className={`font-mono text-sm font-semibold ${active ? 'text-verdigris-deep' : 'text-ink'}`}>
+                          {quote.cost === 0 ? '0 €' : `${formatPrice(quote.cost)} €`}
+                        </span>
+                      )}
+                    </label>
+                  )
+                })}
+              </div>
+            </fieldset>
+
+            <dl className="mt-5 space-y-2 border-t border-hairline pt-4 text-sm">
+              <div className="flex justify-between">
+                <dt className="text-dust">Sous-total</dt>
+                <dd className="font-mono">{formatPrice(total())} €</dd>
+              </div>
+              <div className="flex justify-between">
+                <dt className="text-dust">Livraison</dt>
+                <dd className="font-mono">{formatPrice(quotes[shippingMethod].cost)} €</dd>
+              </div>
+              <div className="flex justify-between border-t border-hairline pt-2 text-base font-semibold">
+                <dt>Total</dt>
+                <dd className="font-mono">
+                  {formatPrice(total() + quotes[shippingMethod].cost)} €
+                </dd>
+              </div>
+            </dl>
+
+            {/*
+              Art. L111-1 : the delay has to be known before the order is
+              placed, not discovered in the confirmation email. This is
+              the exact sentence stored on the order and repeated in that
+              email, plus the date it resolves to.
+            */}
+            <p className="mt-4 rounded-lg bg-paper px-3.5 py-3 text-[13px] leading-relaxed text-ink/80">
+              {promises[shippingMethod].text}
+              <span className="mt-1 block text-dust">
+                {shippingMethod === 'pickup' ? 'Prêt' : 'Livré'} au plus tard le{' '}
+                {formatDeliveryDate(promises[shippingMethod].latestDate)}.
+              </span>
+            </p>
+
+            {error && (
+              <p role="alert" className="mt-3 rounded-lg bg-alert-pale px-3 py-2 text-sm text-alert">
+                {error}
+              </p>
+            )}
+
+            {/*
+              Unticked by default and never pre-ticked: a pre-accepted box
+              is not acceptance. The server re-checks this, because a
+              checkbox the client could simply not send would be proof of
+              nothing.
+            */}
+            <label className="mt-5 flex cursor-pointer items-start gap-2.5 text-sm text-ink">
+              <input
+                type="checkbox"
+                checked={cgvAccepted}
+                onChange={(e) => setCgvAccepted(e.target.checked)}
+                required
+                className="mt-0.5 h-4 w-4 shrink-0 accent-verdigris"
+              />
+              <span>
+                J’ai lu et j’accepte les{' '}
+                <Link href="/cgv" className="font-semibold text-verdigris-deep hover:underline">
+                  conditions générales de vente
+                </Link>{' '}
+                et la{' '}
+                <Link
+                  href="/politique-confidentialite"
+                  className="font-semibold text-verdigris-deep hover:underline"
+                >
+                  politique de confidentialité
+                </Link>
+                .
+              </span>
+            </label>
+
+            <button
+              onClick={handleCheckout}
+              disabled={isLoading || !customerComplete || !cgvAccepted}
+              className="mt-4 w-full rounded-full bg-verdigris py-3.5 text-sm font-semibold text-stone transition-colors hover:bg-verdigris-deep disabled:opacity-60"
+            >
+              {isLoading ? 'Redirection vers le paiement…' : 'Commander avec obligation de paiement'}
+            </button>
+            {!customerComplete && (
+              <p className="mt-2 text-center text-xs text-dust">
+                Complétez vos coordonnées ci-dessus pour continuer.
+              </p>
+            )}
+            {customerComplete && !cgvAccepted && (
+              <p className="mt-2 text-center text-xs text-dust">
+                Acceptez les conditions générales de vente pour continuer.
+              </p>
+            )}
+          </div>
+
+          <p className="text-center font-mono text-[10px] uppercase tracking-widest text-dust">
+            {PRICE_NOTICE}
+          </p>
+        </div>
+      </div>
+    </div>
+  )
+}

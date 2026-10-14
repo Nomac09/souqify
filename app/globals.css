@@ -1,0 +1,113 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* "Quiet premium" identity tokens, sitewide. `--paper` is deliberately a
+   distinct, deeper tone from `--surface` — it's the "mat" a product photo
+   sits on, meant to hold a photo shot on a white background instead of
+   letting it bleed into the page. `--alert` is semantic only (form errors,
+   "unavailable at checkout"), kept apart from `--verdigris` so it never
+   reads as a price/discount treatment. */
+:root {
+  --stone: #E8E7E2;
+  --surface: #F6F5F1;
+  --paper: #DDD9CE;
+  --ink: #22221F;
+  --dust: #605E56;
+  --hairline: #D3D0C8;
+  --hairline-strong: #B9B5A9;
+  --verdigris: #4B5A46;
+  --verdigris-deep: #37422F;
+  --alert: #9B4A3F;
+  --alert-pale: #F3E7E4;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --stone: #1B1D18;
+    --surface: #232620;
+    --paper: #2C2F27;
+    --ink: #EDEAE1;
+    --dust: #A8A497;
+    --hairline: #383B33;
+    --hairline-strong: #4A4D42;
+    --verdigris: #9BB08D;
+    --verdigris-deep: #C3D3B8;
+    --alert: #D48A7D;
+    --alert-pale: #3A2823;
+  }
+}
+:root[data-theme="dark"] {
+  --stone: #1B1D18; --surface: #232620; --paper: #2C2F27;
+  --ink: #EDEAE1; --dust: #A8A497;
+  --hairline: #383B33; --hairline-strong: #4A4D42;
+  --verdigris: #9BB08D; --verdigris-deep: #C3D3B8;
+  --alert: #D48A7D; --alert-pale: #3A2823;
+}
+:root[data-theme="light"] {
+  --stone: #E8E7E2; --surface: #F6F5F1; --paper: #DDD9CE;
+  --ink: #22221F; --dust: #605E56;
+  --hairline: #D3D0C8; --hairline-strong: #B9B5A9;
+  --verdigris: #4B5A46; --verdigris-deep: #37422F;
+  --alert: #9B4A3F; --alert-pale: #F3E7E4;
+}
+
+@layer base {
+  body {
+    @apply antialiased bg-stone text-ink;
+  }
+
+  ::selection {
+    @apply bg-verdigris text-stone;
+  }
+
+  /* Visible keyboard focus everywhere */
+  :focus-visible {
+    outline: 2px solid var(--verdigris);
+    outline-offset: 2px;
+    border-radius: 2px;
+  }
+}
+
+@layer components {
+  .line-clamp-2 {
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+  }
+
+  /* Micro-label: mono uppercase inventory tag */
+  .tag-label {
+    @apply font-mono text-micro uppercase tracking-widest text-dust;
+  }
+}
+
+/* Custom scrollbar */
+::-webkit-scrollbar {
+  width: 8px;
+}
+
+::-webkit-scrollbar-track {
+  background: var(--surface);
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--hairline-strong);
+  border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: var(--dust);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
